@@ -1,2 +1,1 @@
-# CEFS
-building damage change detection
+codex is coming soon
