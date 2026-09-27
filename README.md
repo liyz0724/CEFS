@@ -1,148 +1,245 @@
-# CEFS · Building Damage Assessment
+# CEFS
 
-Baseline implementation and CEFS pseudocode for building damage assessment with bi-temporal remote sensing imagery.
+**Temporally Coupled Cross-Event Frequency–Style Regularization for Building Damage Assessment**
 
-This repository provides a ChangeMamba-based training and evaluation pipeline for xBD. The current training entry point runs the **baseline**. The CEFS file contains an **interface-level pseudocode outline**; it is independent of baseline execution and does not reproduce the paper's method or results.
+CEFS studies cross-event generalization for building damage assessment from bi-temporal remote sensing imagery. It is a training-time regularization framework that leaves the inference architecture unchanged. This repository provides the project code built on ChangeMamba, with MambaBDA-Tiny as the primary backbone.
 
-## Contents
+The experiments use xBD for training and event-disjoint evaluation, and EBD for zero-shot cross-dataset evaluation.
 
-| Component | Included |
+## Repository Structure
+
+| Path | Description |
 | --- | --- |
-| ChangeMamba-based model and CUDA kernel sources | Yes |
-| xBD data loading and baseline training | Yes |
-| Checkpoint loading, training resume and inference | Yes |
-| Building localization and damage assessment metrics | Yes |
-| Optional evaluation grouped by disaster event | Yes |
-| CEFS | Pseudocode outline |
+| `changedetection/models/` | Backbone and decoder implementations |
+| `changedetection/datasets/` | Data loading and preprocessing |
+| `changedetection/configs/` | Model configurations |
+| `changedetection/script/` | Training and inference entry points |
+| `changedetection/tasks/` | Training and evaluation routines |
+| `changedetection/utils_func/` | Loss functions and utilities |
+| `tools/prepare_xbd_event_split.py` | xBD event-based data preparation |
+| `kernels/selective_scan/` | Selective-scan CUDA extensions |
+| `tests/` | Utility, metric, and checkpoint tests |
 
-Dataset files and pretrained weights are obtained separately. This is a maintained project snapshot derived from ChangeMamba, not an assertion of byte-for-byte equivalence with an upstream release.
+## Installation
 
-## Setup
+Use a Linux environment with an NVIDIA GPU. Install PyTorch and torchvision for your CUDA environment, and ensure that the matching CUDA toolkit and `nvcc` are available for building the extensions.
 
-Use Linux with an NVIDIA GPU, a CUDA-compatible PyTorch installation, and a matching CUDA toolkit with `nvcc` for compiling the selective-scan extensions. Start from a Python 3.10 environment compatible with the existing training stack.
-
-Install PyTorch and torchvision for your CUDA environment first, then run the following commands from the repository root:
+Run the following commands from the repository root:
 
 ```bash
 python -m pip install -r requirements.txt
 python -m pip install --no-build-isolation ./kernels/selective_scan
 ```
 
-The dependency list is not a locked environment. Use the same PyTorch/CUDA/compiler combination as your working training environment when possible. The complete model requires its CUDA/Triton dependencies; CPU-only execution is not a supported full-model setup here.
+## Dataset Preparation
 
-## Data preparation
+### Datasets and Protocols
 
-Use preprocessed xBD images and masks arranged under `images/` and `masks/` in each split directory. This release consumes prepared PNG data; it does not convert raw annotation polygons into masks.
-
-| Path | Contents |
-| --- | --- |
-| `data/xBD/train/images/` | Training image pairs |
-| `data/xBD/train/masks/` | Training localization and damage masks |
-| `data/xBD/val/images/` | Validation image pairs |
-| `data/xBD/val/masks/` | Validation masks |
-| `data/xBD/test/images/` | Held-out test image pairs |
-| `data/xBD/test/masks/` | Held-out test masks |
-| `data/xBD/train_set.txt` | Training sample names, one per line |
-| `data/xBD/val_set.txt` | Validation sample names, one per line |
-| `data/xBD/test_set.txt` | Test sample names, one per line |
-
-The loader uses different naming conventions for training patches and evaluation images:
-
-| Split | Example list entry | Corresponding image pair |
+| Dataset | Role | Protocol |
 | --- | --- | --- |
-| Training | `event_00000001_0_0` | `event_00000001_pre_disaster_0_0.png`, `event_00000001_post_disaster_0_0.png` |
-| Validation / test | `event_00000001` | `event_00000001_pre_disaster.png`, `event_00000001_post_disaster.png` |
+| xBD | Training and in-dataset evaluation | Event-disjoint split: 8,202 training, 912 validation, and 1,920 test pairs |
+| EBD | External evaluation | Zero-shot evaluation on 18,215 pairs from 12 events absent from xBD |
 
-Masks use the same filenames as their corresponding images. The current loader reads the first channel of each mask, so provide three-channel PNG masks whose first channel stores integer class IDs, not a color visualization. Localization labels use `0` for background and `1` for buildings. Damage labels use `0` for background and `1–4` for no damage, minor damage, major damage and destroyed buildings. The training loader maps damage-background pixels to ignore label `255`.
+The xBD test events are Nepal flooding, Guatemala volcano, Sunda tsunami, Santa Rosa wildfire, Hurricane Matthew, and Tuscaloosa tornado. Checkpoints are selected using xBD validation overall F1. EBD is used for evaluation without fine-tuning or parameter updates.
 
-Keep training, validation and held-out test sets separate. The training CLI retains the historical argument names `--test_dataset_path` and `--test_data_list_path` for its validation loader; pass the **validation split** to those arguments during training.
+### xBD Data Format
 
-## Baseline training
+Prepare the xBD images and segmentation masks as PNG files. Each split contains an `images/` directory and a `masks/` directory. Sample lists contain one sample name per line, without a file extension.
 
-Place an encoder checkpoint compatible with the selected YAML configuration in `pretrained_weight/`. Replace the example checkpoint filename below with your actual file.
+| Split | Data directory | Sample list |
+| --- | --- | --- |
+| Training | `data/xBD/train/` | `data/xBD/train_set.txt` |
+| Validation | `data/xBD/val/` | `data/xBD/val_set.txt` |
+| Test | `data/xBD/test/` | `data/xBD/test_set.txt` |
+
+The data loader expects the following naming conventions:
+
+| Split | Example list entry | Image filenames |
+| --- | --- | --- |
+| Training patches | `event_00000001_0_0` | `event_00000001_pre_disaster_0_0.png` and `event_00000001_post_disaster_0_0.png` |
+| Validation / test | `event_00000001` | `event_00000001_pre_disaster.png` and `event_00000001_post_disaster.png` |
+
+Masks use the same filenames as the corresponding images. Provide three-channel masks with integer class IDs in the first channel. Localization masks use `0` for background and `1` for buildings. Damage masks use the following labels:
+
+| Label | Class |
+| --- | --- |
+| 0 | Background |
+| 1 | No damage |
+| 2 | Minor damage |
+| 3 | Major damage |
+| 4 | Destroyed |
+
+During training, damage-background pixels are mapped to ignore label `255`.
+
+### Event-based Split
+
+Use `tools/prepare_xbd_event_split.py` to reorganize a prepared xBD dataset into an event-based training, validation, and test split. The script operates on existing PNG images and masks; raw polygon annotations must be converted to masks beforehand.
+
+The input dataset root must contain all three source subsets and their sample lists:
+
+| Source subset | Image directory | Mask directory | Sample list |
+| --- | --- | --- | --- |
+| Train | `train/images/` | `train/masks/` | `train_set.txt` |
+| Test | `test/images/` | `test/masks/` | `test_set.txt` |
+| Hold | `hold/images/` | `hold/masks/` | `hold_set.txt` |
+
+Source training files use the `_pre_disaster_0_0.png` and `_post_disaster_0_0.png` suffixes. Source test and hold files use `_pre_disaster.png` and `_post_disaster.png`. This script expects this specific prepared naming format.
+
+```bash
+python -m pip install scikit-learn
+
+python tools/prepare_xbd_event_split.py \
+  --dataset-root data/XBD_ChangeMamba \
+  --output-dir data/xBD_event \
+  --seed 321 \
+  --val-ratio 0.1 \
+  --link-mode symlink
+```
+
+The script assigns samples from 13 configured source events to training and validation, with a stratified 90/10 split by default. Six configured events are reserved for testing. Training and validation share source events; test events are disjoint from both. The event lists are defined in `TRAIN_EVENTS` and `TEST_EVENTS` inside the script.
+
+`symlink` creates symbolic links and requires the original files to remain accessible. Use `--link-mode copy` for a standalone copy, or `--link-mode hardlink` when source and destination are on the same filesystem. Duplicate sample identifiers and unknown event names are rejected.
+
+The generated output contains:
+
+| Output path | Contents |
+| --- | --- |
+| `data/xBD_event/data/train/` | Training images and masks |
+| `data/xBD_event/data/val/` | Validation images and masks |
+| `data/xBD_event/data/test/` | Test images and masks |
+| `data/xBD_event/train_set.txt` | Training sample list |
+| `data/xBD_event/val_set.txt` | Validation sample list |
+| `data/xBD_event/test_set.txt` | Test sample list |
+| `data/xBD_event/event_split_manifest.csv` | Sample assignments and source subsets |
+| `data/xBD_event/event_split_summary.json` | Counts, event lists, and overlap checks |
+| `data/xBD_event/event_split_audit.md` | Human-readable split report |
+
+Review the generated summary before training. Retain the generated lists and the splitting environment for reproducibility; the script has a dependency-free fallback that can produce different assignments from scikit-learn even with the same seed. Use a new output directory for a new split.
+
+To train on this split, replace the four data arguments in the training command with:
+
+```bash
+  --train_dataset_path data/xBD_event/data/train \
+  --train_data_list_path data/xBD_event/train_set.txt \
+  --test_dataset_path data/xBD_event/data/val \
+  --test_data_list_path data/xBD_event/val_set.txt
+```
+
+For final evaluation, use `data/xBD_event/data/test` and `data/xBD_event/test_set.txt` in the inference command.
+
+### EBD Data Preparation
+
+For evaluation with the existing loader, export EBD to the same paired-image and mask format described above. The directory names below describe the prepared evaluation layout, rather than the raw EBD download structure.
+
+| Prepared path | Contents |
+| --- | --- |
+| `data/EBD/test/images/` | Registered pre-event and post-event RGB PNG images |
+| `data/EBD/test/masks/` | Localization and damage masks aligned with the image pairs |
+| `data/EBD/test_set.txt` | Sample identifiers, one per line |
+
+Prepare the evaluation data as follows:
+
+1. Match the pre-event image, post-event image, localization mask, and damage mask for each sample. Keep the two timestamps and their spatial alignment consistent.
+2. Export the masks using the label convention in the xBD section: binary localization and damage IDs `0–4`. Use three-channel mask PNGs with class IDs in the first channel. Resolve annotation-label mappings from the EBD annotations before export; do not use RGB visualization colors as class IDs.
+3. Assign each pair an identifier such as `hurricane-ian_00000001`. Use an event prefix followed by a numeric identifier of at least six digits so event-wise reporting can recover the event name.
+4. Save the pair as `<identifier>_pre_disaster.png` and `<identifier>_post_disaster.png` under `images/`. Save the corresponding masks with the same filenames under `masks/`.
+5. Write the identifiers, without extensions or timestamp suffixes, to `test_set.txt`. Check for missing files, duplicate identifiers, mismatched dimensions, and invalid label values.
+6. Apply the same input preprocessing to every model being compared. Keep EBD outside training and checkpoint selection.
+
+The manuscript evaluates Turkey earthquake, Hurricanes Delta, Dorian, Ian, Ida, Irma and Laura, Mount Semeru eruption, Pakistan flooding, St. Vincent volcano, Texas tornadoes, and Tonga volcano. For the full evaluation set, check that the prepared list contains 18,215 pairs across these 12 events.
+
+## Training
+
+The following example trains the ChangeMamba baseline. Place a compatible encoder checkpoint in `pretrained_weight/` and replace `encoder_tiny.pth` with its filename.
 
 ```bash
 python changedetection/script/train_MambaBDA.py \
   --dataset xBD \
-  --cfg changedetection/configs/vssm1/vssm_small_224.yaml \
-  --encoder_pretrained_path pretrained_weight/encoder_small.pth \
+  --cfg changedetection/configs/vssm1/vssm_tiny_224_0229flex.yaml \
+  --encoder_pretrained_path pretrained_weight/encoder_tiny.pth \
   --train_dataset_path data/xBD/train \
   --train_data_list_path data/xBD/train_set.txt \
   --test_dataset_path data/xBD/val \
   --test_data_list_path data/xBD/val_set.txt \
-  --batch_size 4 \
+  --batch_size 16 \
   --crop_size 256 \
   --max_iters 50000 \
+  --learning_rate 1e-4 \
+  --weight_decay 5e-3 \
   --seed 0 \
-  --model_type baseline_small \
+  --model_type baseline_tiny \
   --model_param_path saved_models
 ```
 
-These settings are usage examples, not the paper's reproduction configuration. Adjust the batch size to the available GPU memory. Training evaluates every 750 iterations and saves `best_model.pth` and `latest.pth` under the generated experiment directory. A run shorter than its first evaluation interval does not produce these evaluation checkpoints.
+The baseline example uses the training schedule described in the manuscript: 50,000 iterations, 256 × 256 crops, batch size 16, and AdamW with learning rate `1e-4` and weight decay `5e-3`. Repeat experiments with seeds `0`, `1`, and `2`. Adjust batch size if required by GPU memory. The training arguments `--test_dataset_path` and `--test_data_list_path` specify the validation data used for checkpoint selection. Use a separate held-out split for final evaluation.
 
-For full training resume, append the following argument to the same training command:
+Checkpoints are saved under `saved_models/xBD/<run>/`. Evaluation occurs every 750 iterations; `best_model.pth` stores the best evaluated model and `latest.pth` stores the latest evaluation checkpoint.
+
+### Resume Training
+
+To resume training, append the following option to the training command:
 
 ```bash
 --resume_training_path saved_models/xBD/YOUR_RUN/latest.pth
 ```
 
-For weight-only initialization, use `--model_checkpoint_path` instead. Do not combine weight-only initialization and training resume.
+Use `--model_checkpoint_path` for model-weight initialization without restoring the optimizer state. These two options are mutually exclusive.
 
-## Inference and evaluation
+## Evaluation
 
-Use a full baseline checkpoint and the same architecture configuration used for training:
+Load a full-model checkpoint with the same architecture configuration used for training:
 
 ```bash
 python changedetection/script/infer_MambaBDA.py \
   --dataset xBD \
-  --cfg changedetection/configs/vssm1/vssm_small_224.yaml \
+  --cfg changedetection/configs/vssm1/vssm_tiny_224_0229flex.yaml \
   --model_checkpoint_path saved_models/xBD/YOUR_RUN/best_model.pth \
   --test_dataset_path data/xBD/test \
   --test_data_list_path data/xBD/test_set.txt \
   --crop_size 256 \
-  --model_type baseline_small \
+  --model_type baseline_tiny \
   --result_saved_path results
 ```
 
-Add `--report_by_event` to obtain metrics grouped by disaster event. The full-model checkpoint must match the model architecture; an encoder-only checkpoint is insufficient for evaluation.
+Add `--report_by_event` to report results separately for each disaster event.
 
-| Metric | Meaning |
+| Metric | Description |
 | --- | --- |
 | `loc_F1` | Building localization F1 |
-| `clf_F1` | Harmonic mean of F1 across the four building damage classes |
-| `oa_F1` | `0.3 × loc_F1 + 0.7 × clf_F1` |
+| `clf_F1` | Harmonic mean of F1 across the four damage classes |
+| `oa_F1` | Overall score: `0.3 × loc_F1 + 0.7 × clf_F1` |
 
-## CEFS pseudocode
+### Zero-Shot Evaluation on EBD
 
-The outline is located at [`changedetection/utils_func/cefs.py`](changedetection/utils_func/cefs.py).
+After preparing EBD in the layout above, evaluate an xBD-trained checkpoint without updating its parameters:
 
-```text
-PROCEDURE CEFS_TRAINING_OBJECTIVE(batch, model, configuration):
-    objective <- METHOD_SPECIFIC_PROCEDURE(batch, model, configuration)
-    RETURN objective
+```bash
+python changedetection/script/infer_MambaBDA.py \
+  --dataset xBD \
+  --cfg changedetection/configs/vssm1/vssm_tiny_224_0229flex.yaml \
+  --model_checkpoint_path saved_models/xBD/YOUR_RUN/best_model.pth \
+  --test_dataset_path data/EBD/test \
+  --test_data_list_path data/EBD/test_set.txt \
+  --crop_size 256 \
+  --model_type xbd_to_ebd \
+  --result_saved_path results/EBD \
+  --report_by_event
 ```
 
-`METHOD_SPECIFIC_PROCEDURE` denotes an abstract operation, not an implementation recipe. The outline intentionally leaves out internal operations, mathematical definitions and configuration values. It does not execute or alter baseline training.
-
-## Roadmap
-
-- [x] Baseline training and evaluation pipeline
-- [x] CEFS interface-level pseudocode
-- [ ] Complete CEFS implementation after paper acceptance
-- [ ] Paper-specific configurations and reproduction instructions
+`--dataset xBD` selects the loader for the prepared image-and-mask format; the input paths select EBD. The printed summary pools confusion matrices across all samples, while event-wise reports aggregate samples by event. Event-macro overall F1 is the unweighted mean of the 12 event-level overall F1 values and should be calculated from those reports. Report three-seed means using the corresponding xBD-selected checkpoints.
 
 ## Tests
-
-In an environment with the required dependencies installed:
 
 ```bash
 python -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The tests cover utility behavior, metrics and checkpoint handling. They do not establish full GPU training reproducibility or validate CEFS.
+## Acknowledgments
 
-## Acknowledgments and license
+This project builds on ChangeMamba and its VMamba/Mamba components. We thank the original authors for their work. Please cite the corresponding original papers when using these components, as well as the xBD and EBD dataset papers when using the data.
 
-This project builds on ChangeMamba and its VMamba/Mamba-related components. Credit belongs to the original authors of those components. Existing source notices and the supplied [LICENSE](LICENSE) are retained. This repository does not claim the baseline architecture or third-party kernels as the contribution of CEFS.
+EBD reference: Z. Wang, C. Wu, F. Zhang, and J. Xia, “Constructing an Extensible Building Damage Dataset via Semi-Supervised Fine-Tuning Across 12 Natural Disasters,” *Journal of Remote Sensing*, vol. 5, article 0733, 2025. DOI: `10.34133/remotesensing.0733`.
 
-When using third-party code, pretrained weights or datasets, consult their respective terms and cite the corresponding original work. Paper-specific bibliographic information will be added with the full release.
+## License
+
+See [LICENSE](LICENSE). Existing third-party copyright and license notices are retained. Datasets and pretrained weights are subject to their respective terms.
